@@ -1,4 +1,4 @@
-//#![deny(warnings)]
+#![deny(warnings)]
 
 use geese::*;
 use std::any::*;
@@ -11,57 +11,67 @@ use std::sync::mpsc::*;
 use std::sync::mpsc::Receiver;
 use takecell::*;
 
-/// Represents a boxed object that can be sent to other Geese instances.
-type NetworkSendable = Box<dyn Any + Send + Sync>;
-/// Represents a boxed object that can be sent to multiple other Geese instances.
-type NetworkBroadcastable = Box<dyn Broadcastable>;
+pub struct Message(Box<dyn InnerMessage>);
 
-/// Represents a type that is safe to broadcast,
-/// which can clone and perform reflection upon itself.
-trait Broadcastable: Any + Send + Sync {
-    /// Converts this broadcastable instance into a `std::any::Any`.
-    fn as_sendable(self: Box<Self>) -> NetworkSendable;
-    /// Dynamically clones this broadcastable instance.
-    fn clone_box(&self) -> Box<dyn Broadcastable>;
+impl Message {
+    pub fn new<T: 'static + Send + Sync>(message: T) -> Self {
+        Self(Box::new(message))
+    }
+
+    pub fn into_inner(self) -> Box<dyn Any> {
+        self.0.into_inner()
+    }
+
+    pub fn into_message_event(self, sender: ConnectionHandle) -> Box<dyn Any> {
+        self.0.into_message_event(sender)
+    }
 }
 
-impl<T: Any + Clone + Send + Sync> Broadcastable for T {
-    fn as_sendable(self: Box<Self>) -> NetworkSendable {
+trait IntoClonedMessage: Send + Sync {
+    fn cloned_message(&self) -> Message;
+}
+
+impl<T: 'static + Clone + Send + Sync> IntoClonedMessage for T {
+    fn cloned_message(&self) -> Message {
+        Message::new(self.clone())
+    }
+}
+
+trait InnerMessage: Send + Sync {
+    fn into_inner(self: Box<Self>) -> Box<dyn Any>;
+    fn into_message_event(self: Box<Self>, sender: ConnectionHandle) -> Box<dyn Any>;
+}
+
+impl<T: 'static + Send + Sync> InnerMessage for T {
+    fn into_inner(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 
-    fn clone_box(&self) -> Box<dyn Broadcastable> {
-        Box::new(self.clone())
+    fn into_message_event(self: Box<Self>, sender: ConnectionHandle) -> Box<dyn Any> {
+        Box::new(on::Message::new(*self, sender))
     }
-}
-
-/// Represents an event that can be converted to an `RPC<_>` with
-/// an associated sending channel.
-trait IntoRPC: Any + Send + Sync {
-    /// Converts this into an RPC with the associated channel as the sender.
-    fn into_rpc(self: Box<Self>, channel: ConnectionHandle) -> Box<dyn Any>;
 }
 
 /// Represents a connection across which one can forward events.
 pub trait PeerChannel {
     /// Reads an event from the channel. Returns none if there was no new event
     /// available.
-    #[must_use]
-    fn read(&self) -> std::io::Result<Option<NetworkSendable>>;
+    fn read(&self) -> std::io::Result<Option<Message>>;
+
     /// Writes an event to the channel.
-    #[must_use]
-    fn write(&self, message: NetworkSendable) -> std::io::Result<()>;
+    fn write(&self, message: Message) -> std::io::Result<()>;
 }
 
 /// Represents an in-process peer channel for sending events
 /// from one Geese instance to another.
 #[derive(Debug)]
 pub struct LocalChannel {
-    sender: Sender<NetworkSendable>,
-    receiver: Receiver<NetworkSendable>
+    sender: Sender<Message>,
+    receiver: Receiver<Message>
 }
 
 impl LocalChannel {
+    /// Creates a new pair of channels that can send in-process messages to one another.
     pub fn new_pair() -> (Self, Self) {
         let (outgoing_b, incoming_a) = channel();
         let (outgoing_a, incoming_b) = channel();
@@ -71,7 +81,7 @@ impl LocalChannel {
 }
 
 impl PeerChannel for LocalChannel {
-    fn read(&self) -> std::io::Result<Option<NetworkSendable>> {
+    fn read(&self) -> std::io::Result<Option<Message>> {
         match self.receiver.try_recv() {
             Ok(x) => Ok(Some(x)),
             Err(TryRecvError::Disconnected) => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, TryRecvError::Disconnected)),
@@ -79,7 +89,7 @@ impl PeerChannel for LocalChannel {
         }
     }
 
-    fn write(&self, message: NetworkSendable) -> std::io::Result<()> {
+    fn write(&self, message: Message) -> std::io::Result<()> {
         self.sender.send(message).map_err(|x| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, x))
     }
 }
@@ -111,12 +121,12 @@ impl PartialEq for ConnectionHandle {
 impl Eq for ConnectionHandle {}
 
 /// Stores and manages peer connections to other Geese instances.
-pub struct ConnnectionPool {
+pub struct ConnectionPool {
     ctx: GeeseContextHandle,
     peer_connections: RefCell<HashMap<ConnectionHandle, Box<dyn PeerChannel>>>
 }
 
-impl ConnnectionPool {
+impl ConnectionPool {
     /// Adds the provided peer to the connection pool, enabling it to
     /// send and receive events.
     pub fn add_peer(&self, channel: Box<dyn PeerChannel>) -> ConnectionHandle {
@@ -140,19 +150,18 @@ impl ConnnectionPool {
         self.ctx.raise_event(on::PeerRemoved { handle: peer, reason: error });
     }
 
-    /// Broadcasts the RPC to all specified remote peers. If any remote peer is no longer connected,
+    /// Broadcasts the message to all specified remote peers. If any remote peer is no longer connected,
     /// it is ignored.
-    fn broadcast_rpc(&mut self, rpc: &notify::BroadcastRPC) {
-        let event = rpc.event.take().expect("The event was already taken.");
-        for recipient in rpc.recipients.take().expect("The recipient iterator was already taken.") {
-            self.write_event(event.clone_box().as_sendable(), recipient);
+    fn broadcast_message(&mut self, message: &notify::BroadcastMessage) {
+        for recipient in message.recipients.take().expect("The recipient iterator was already taken.") {
+            self.write_event(message.event.cloned_message(), recipient);
         }
     }
 
-    /// Sends the RPC to the specified remote peer. If the remote peer is no longer connected,
-    /// the RPC is dropped.
-    fn send_rpc(&mut self, rpc: &notify::RPC) {
-        self.write_event(rpc.event.take().expect("Event was already taken."), rpc.recipient.clone());
+    /// Sends the message to the specified remote peer. If the remote peer is no longer connected,
+    /// the message is dropped.
+    fn send_message(&mut self, message: &notify::Message) {
+        self.write_event(message.event.take().expect("Event was already taken."), message.recipient.clone());
     }
 
     /// Retrieves a mutable reference to the connections map of this struct.
@@ -160,6 +169,7 @@ impl ConnnectionPool {
         self.peer_connections.borrow_mut()
     }
 
+    /// Reads new event messages from remote Geese systems.
     fn read_events(&mut self, _: &notify::Update) {
         let connections = self.peer_connections().keys().cloned().collect::<Vec<_>>();
         for conn in connections {
@@ -167,33 +177,35 @@ impl ConnnectionPool {
         }
     }
 
+    /// Reads the next message from the given connection,
+    /// returning whether another read should be attempted.
     fn read_peer(&mut self, handle: ConnectionHandle) -> bool {
         let result = self.peer_connections()[&handle].read();
         match result {
-            Ok(Some(event)) => { self.ctx.raise_boxed_event(event); true },
+            Ok(Some(event)) => { self.ctx.raise_boxed_event(event.into_message_event(handle)); true },
             Ok(None) => false,
             Err(error) => {
-                self.handle_peer_disconnection(handle.clone(), error);
+                self.handle_peer_disconnection(handle, error);
                 false
             }
         }
     }
 
     /// Writes the given event to the specified recipient, and handles errors that occur
-    /// by disconnecting the client. If the remote peer is no longer connected, the RPC
+    /// by disconnecting the client. If the remote peer is no longer connected, the message
     /// is dropped.
-    fn write_event(&mut self, event: NetworkSendable, recipient: ConnectionHandle) {
+    fn write_event(&mut self, event: Message, recipient: ConnectionHandle) {
         let result = self.peer_connections().get(&recipient)
             .map(|conn| conn.write(event))
             .unwrap_or(Ok(()));
 
         if let Err(error) = result {
-            self.handle_peer_disconnection(recipient.clone(), error);
+            self.handle_peer_disconnection(recipient, error);
         }
     }
 }
 
-impl GeeseSystem for ConnnectionPool {
+impl GeeseSystem for ConnectionPool {
     fn new(ctx: GeeseContextHandle) -> Self {
         let peer_connections = RefCell::new(HashMap::default());
 
@@ -205,9 +217,9 @@ impl GeeseSystem for ConnnectionPool {
 
     fn register(with: &mut GeeseSystemData<Self>) {
         with.event(Self::add_peer_event);
-        with.event(Self::broadcast_rpc);
+        with.event(Self::broadcast_message);
         with.event(Self::read_events);
-        with.event(Self::send_rpc);
+        with.event(Self::send_message);
     }
 }
 
@@ -215,14 +227,14 @@ impl GeeseSystem for ConnnectionPool {
 pub mod notify {
     use super::*;
 
-    /// Broadcast the given event to all specified recipients in the connection pool. Shorthand for `BroadcastRPC::new`.
-    pub fn broadcast<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> BroadcastRPC {
-        BroadcastRPC::new(event, recipients)
+    /// Broadcast the given event to all specified recipients in the connection pool. Shorthand for `BroadcastMessage::new`.
+    pub fn broadcast<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> BroadcastMessage {
+        BroadcastMessage::new(event, recipients)
     }
 
-    /// Broadcast the given event to the specified recipient. Shorthand for `RPC::new`.
-    pub fn rpc<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> RPC {
-        RPC::new(event, recipient)
+    /// Broadcast the given event to the specified recipient. Shorthand for `Message::new`.
+    pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> Message {
+        Message::new(event, recipient)
     }
 
     /// Adds a channel to the pool of active connections.
@@ -238,28 +250,28 @@ pub mod notify {
     }
 
     /// Causes the connection pool to notify a single recipient of an event.
-    pub struct RPC {
-        pub(super) event: TakeOwnCell<NetworkSendable>,
+    pub struct Message {
+        pub(super) event: TakeOwnCell<super::Message>,
         pub(super) recipient: ConnectionHandle
     }
 
-    impl RPC {
-        /// Creates a new RPC for the given underlying event and recipient.
+    impl Message {
+        /// Creates a new message for the given underlying event and recipient.
         pub fn new<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> Self {
-            Self { event: TakeOwnCell::new(Box::new(event)), recipient }
+            Self { event: TakeOwnCell::new(super::Message::new(event)), recipient }
         }
     }
 
     /// Causes the connection pool to notify a set of recipients of an event.
-    pub struct BroadcastRPC {
-        pub(super) event: TakeOwnCell<NetworkBroadcastable>,
+    pub struct BroadcastMessage {
+        pub(super) event: Box<dyn IntoClonedMessage>,
         pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionHandle>>>
     }
 
-    impl BroadcastRPC {
-        /// Creates a new broadcast RPC for the given underlying event and recipients.
+    impl BroadcastMessage {
+        /// Creates a new broadcast message for the given underlying event and recipients.
         pub fn new<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> Self {
-            Self { event: TakeOwnCell::new(Box::new(event)), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
+            Self { event: Box::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
         }
     }
 
@@ -288,31 +300,30 @@ pub mod on {
         pub reason: std::io::Error
     }
 
-    /// Raised when an RPC is receiver from another Geese instance in the connection pool.
-    #[derive(Clone, Debug)]
-    pub struct RPC<T: 'static + Send + Sync> {
+    /// Raised when a message is received from another Geese instance in the connection pool.
+    pub struct Message<T: 'static + Send + Sync> {
         event: T,
         sender: ConnectionHandle
     }
 
-    impl<T: 'static + Send + Sync> RPC<T> {
-        /// Creates a new RPC event from the given underlying event and sender.
+    impl<T: 'static + Send + Sync> Message<T> {
+        /// Creates a new message for the event and sender.
         pub(super) fn new(event: T, sender: ConnectionHandle) -> Self {
             Self { event, sender }
         }
 
-        /// Retrieves the event associated with this RPC.
+        /// Obtains the event associated with this message.
         pub fn event(&self) -> &T {
             &self.event
         }
 
-        /// Retrieves a handle to the sender of the RPC.
+        /// Obtains the sender associated with this message.
         pub fn sender(&self) -> ConnectionHandle {
             self.sender.clone()
         }
     }
 
-    impl<T: 'static + Send + Sync> Deref for RPC<T> {
+    impl<T: 'static + Send + Sync> Deref for Message<T> {
         type Target = T;
 
         fn deref(&self) -> &Self::Target {
