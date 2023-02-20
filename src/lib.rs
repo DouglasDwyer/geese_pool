@@ -41,11 +41,11 @@
 //! 
 //! # fn run() {
 //! let mut a = GeeseContext::default();
-//! a.raise_event(geese::notify::AddSystem::new::<ConnectionPool>());
-//! a.raise_event(geese::notify::AddSystem::new::<Receiver>());
+//! a.raise_event(geese::notify::add_system::<ConnectionPool>());
+//! a.raise_event(geese::notify::add_system::<Receiver>());
 //!
 //! let mut b = GeeseContext::default();
-//! b.raise_event(geese::notify::AddSystem::new::<ConnectionPool>());
+//! b.raise_event(geese::notify::add_system::<ConnectionPool>());
 //! 
 //! let (chan_a, chan_b) = LocalChannel::new_pair();
 //! a.system::<ConnectionPool>().add_peer(Box::new(chan_a));
@@ -322,14 +322,26 @@ impl GeeseSystem for ConnectionPool {
 pub mod notify {
     use super::*;
 
-    /// Broadcast the given event to all specified recipients in the connection pool. Shorthand for `BroadcastMessage::new`.
-    pub fn broadcast<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> BroadcastMessage {
-        BroadcastMessage::new(event, recipients)
+    /// Causes the connection pool to notify a single recipient of an event.
+    pub struct Message {
+        pub(super) event: TakeOwnCell<super::Message>,
+        pub(super) recipient: ConnectionHandle
     }
 
-    /// Broadcast the given event to the specified recipient. Shorthand for `Message::new`.
+    /// Sends the given event to the specified recipient.
     pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> Message {
-        Message::new(event, recipient)
+        Message { event: TakeOwnCell::new(super::Message::new(event)), recipient }
+    }
+
+    /// Causes the connection pool to notify a set of recipients of an event.
+    pub struct BroadcastMessage {
+        pub(super) event: Box<dyn IntoClonedMessage>,
+        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionHandle>>>
+    }
+
+    /// Broadcast the given event to all specified recipients in the connection pool.
+    pub fn broadcast<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> BroadcastMessage {
+        BroadcastMessage { event: Box::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
     }
 
     /// Adds a channel to the pool of active connections.
@@ -346,32 +358,6 @@ pub mod notify {
 
     /// Removes a channel from the pool.
     pub struct RemovePeer(pub ConnectionHandle);
-
-    /// Causes the connection pool to notify a single recipient of an event.
-    pub struct Message {
-        pub(super) event: TakeOwnCell<super::Message>,
-        pub(super) recipient: ConnectionHandle
-    }
-
-    impl Message {
-        /// Creates a new message for the given underlying event and recipient.
-        pub fn new<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> Self {
-            Self { event: TakeOwnCell::new(super::Message::new(event)), recipient }
-        }
-    }
-
-    /// Causes the connection pool to notify a set of recipients of an event.
-    pub struct BroadcastMessage {
-        pub(super) event: Box<dyn IntoClonedMessage>,
-        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionHandle>>>
-    }
-
-    impl BroadcastMessage {
-        /// Creates a new broadcast message for the given underlying event and recipients.
-        pub fn new<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> Self {
-            Self { event: Box::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
-        }
-    }
 
     /// Causes the connection pool to update all connections
     /// and raise any newly-received events appropriately.
@@ -455,11 +441,11 @@ mod tests {
     #[test]
     fn test_local_message() {
         let mut a = GeeseContext::default();
-        a.raise_event(geese::notify::AddSystem::new::<ConnectionPool>());
-        a.raise_event(geese::notify::AddSystem::new::<Receiver>());
+        a.raise_event(geese::notify::add_system::<ConnectionPool>());
+        a.raise_event(geese::notify::add_system::<Receiver>());
 
         let mut b = GeeseContext::default();
-        b.raise_event(geese::notify::AddSystem::new::<ConnectionPool>());
+        b.raise_event(geese::notify::add_system::<ConnectionPool>());
 
         let (chan_a, chan_b) = LocalChannel::new_pair();
         a.system::<ConnectionPool>().add_peer(Box::new(chan_a));
