@@ -2,7 +2,7 @@
 
 //! This crate provides the ability to pass messages between multiple Geese instances,
 //! which may exist in separate processes or even on separate computers. The crate functions
-//! by maintaining a `ConnectionPool` of channels to other instances, through which messages
+//! by maintaining a `GeesePool` of channels to other instances, through which messages
 //! may be sent or received. Systems may send or receive messages by raising the appropriate
 //! `geese_pool` events.
 //! 
@@ -11,7 +11,7 @@
 //! consumer to provide both a means of message serialization and network transport.
 //! 
 //! The following is a brief example of how an event may be sent between two separate event systems.
-//! The example first creates two Geese contexts, and adds the `ConnectionPool` system to both.
+//! The example first creates two Geese contexts, and adds the `GeesePool` system to both.
 //! Then, it creates a channel pair across which events may be forwarded, and places one channel
 //! in each connection pool. Finally, the connection pool of `b` is notified to send an integer
 //! to `a`. When `a` is subsequently updated, a message event containing the same integer is raised
@@ -41,17 +41,19 @@
 //! 
 //! # fn run() {
 //! let mut a = GeeseContext::default();
-//! a.raise_event(geese::notify::add_system::<ConnectionPool>());
+//! a.raise_event(geese::notify::add_system::<GeesePool>());
 //! a.raise_event(geese::notify::add_system::<Receiver>());
 //!
 //! let mut b = GeeseContext::default();
-//! b.raise_event(geese::notify::add_system::<ConnectionPool>());
+//! b.raise_event(geese::notify::add_system::<GeesePool>());
 //! 
 //! let (chan_a, chan_b) = LocalChannel::new_pair();
-//! a.system::<ConnectionPool>().add_peer(Box::new(chan_a));
-//! let handle_a = b.system::<ConnectionPool>().add_peer(Box::new(chan_b));
 //! 
-//! b.raise_event(geese_pool::notify::message(1, handle_a));
+//! // Handles must be kept alive, as they are tied to the lifetime of a connection.
+//! let _handle_b = a.system::<GeesePool>().add_peer(Box::new(chan_a));
+//! let handle_a = b.system::<GeesePool>().add_peer(Box::new(chan_b));
+//! 
+//! b.raise_event(geese_pool::notify::message(1, handle_a.clone()));
 //! b.flush_events();
 //! 
 //! a.raise_event(geese_pool::notify::Update);
@@ -61,69 +63,57 @@
 //! # }
 //! ```
 
+// Provides a `PeerChannel` implementation that serializes and deserializes its data.
+//#[cfg(feature = "serde")]
+//pub mod serde;
+
+use fxhash::*;
 use geese::*;
 use std::any::*;
 use std::cell::*;
 use std::collections::*;
 use std::hash::*;
+use std::iter::*;
 use std::ops::*;
 use std::sync::*;
+use std::sync::atomic::*;
 use std::sync::mpsc::*;
 use std::sync::mpsc::Receiver;
 use takecell::*;
 
 /// Represents a message that may be forwarded across Geese instances.
-pub struct Message(Box<dyn InnerMessage>);
+#[derive(Clone)]
+pub struct Message(Arc<dyn InnerMessage>);
 
 impl Message {
     /// Creates a new message containing the given structure.
     pub fn new<T: 'static + Send + Sync>(message: T) -> Self {
-        Self(Box::new(message))
+        Self(Arc::new(message))
     }
 
     /// Converts this message into a `Box` containing the underlying data.
-    pub fn into_inner(self) -> Box<dyn Any> {
-        self.0.into_inner()
+    pub fn as_inner(&self) -> &dyn Any {
+        &self.0
     }
 
     /// Converts this message into a `Box` containing an `on::Message` event that
     /// holds the underlying data.
-    pub fn into_message_event(self, sender: ConnectionHandle) -> Box<dyn Any> {
-        self.0.into_message_event(sender)
-    }
-}
-
-/// Provides the ability for a type to produce multiple cloned
-/// messages representing itself.
-trait IntoClonedMessage: Send + Sync {
-    /// Provides a message object containing a clone of this object's data.
-    fn cloned_message(&self) -> Message;
-}
-
-impl<T: 'static + Clone + Send + Sync> IntoClonedMessage for T {
-    fn cloned_message(&self) -> Message {
-        Message::new(self.clone())
+    pub fn as_message_event(&self, sender: ConnectionId) -> Box<dyn Any> {
+        self.0.clone().into_message_event(sender)
     }
 }
 
 /// Provides the backing implementation for conversion between
 /// messages and inner types.
-trait InnerMessage: Send + Sync {
-    /// Converts this into a `Box` containing the underlying data.
-    fn into_inner(self: Box<Self>) -> Box<dyn Any>;
-
+trait InnerMessage: Any + Send + Sync {
     /// Converts this into a `Box` containing an `on::Message` event that
     /// holds the underlying data.
-    fn into_message_event(self: Box<Self>, sender: ConnectionHandle) -> Box<dyn Any>;
+    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any>;
 }
 
-impl<T: 'static + Send + Sync> InnerMessage for T {
-    fn into_inner(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-
-    fn into_message_event(self: Box<Self>, sender: ConnectionHandle) -> Box<dyn Any> {
-        Box::new(on::Message::new(*self, sender))
+impl<T: 'static + Any + Send + Sync> InnerMessage for T {
+    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any> {
+        Box::new(on::Message::new(self, sender))
     }
 }
 
@@ -131,10 +121,10 @@ impl<T: 'static + Send + Sync> InnerMessage for T {
 pub trait PeerChannel {
     /// Reads an event from the channel. Returns none if there was no new event
     /// available.
-    fn read(&self) -> std::io::Result<Option<Message>>;
+    fn read(&mut self) -> std::io::Result<Option<Message>>;
 
     /// Writes an event to the channel.
-    fn write(&self, message: Message) -> std::io::Result<()>;
+    fn write(&mut self, message: &Message) -> std::io::Result<()>;
 }
 
 /// Represents an in-process peer channel for sending events
@@ -156,7 +146,7 @@ impl LocalChannel {
 }
 
 impl PeerChannel for LocalChannel {
-    fn read(&self) -> std::io::Result<Option<Message>> {
+    fn read(&mut self) -> std::io::Result<Option<Message>> {
         match self.receiver.try_recv() {
             Ok(x) => Ok(Some(x)),
             Err(TryRecvError::Disconnected) => Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, TryRecvError::Disconnected)),
@@ -164,122 +154,189 @@ impl PeerChannel for LocalChannel {
         }
     }
 
-    fn write(&self, message: Message) -> std::io::Result<()> {
-        self.sender.send(message).map_err(|x| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, x))
+    fn write(&mut self, message: &Message) -> std::io::Result<()> {
+        self.sender.send(message.clone()).map_err(|x| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, x))
     }
 }
 
-/// Represents a handle to another Geese instance in the connection pool. Connection handles
-/// may be utilized to send messages or identify the senders of received messages.
-#[derive(Clone)]
-pub struct ConnectionHandle(Arc<()>);
+/// Represents an owned handle to another Geese instance in the connection pool. Connection handles
+/// may be utilized to identify connections, and control their lifetimes. When a connection handle
+/// is dropped, the underlying connection is terminated. All handles must be dropped before
+/// a `GeesePool` is disposed, or a panic will occur.
+pub struct ConnectionHandle {
+    id: ConnectionId,
+    disposed_token: Arc<AtomicBool>
+}
 
 impl ConnectionHandle {
     /// Creates a new, unique connection handle.
     fn new() -> Self {
-        Self(Arc::default())
+        Self {
+            id: ConnectionId::new(),
+            disposed_token: Arc::default()
+        }
+    }
+
+    /// Obtains a shared reference to the token that determines
+    /// whether this connection handle has been dropped.
+    fn disposed_token(&self) -> Arc<AtomicBool> {
+        self.disposed_token.clone()
     }
 }
 
 impl std::fmt::Debug for ConnectionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&format!("{}", (&*self.0 as *const ()) as usize))
+        self.id.fmt(f)
     }
 }
 
 impl Hash for ConnectionHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (&*self.0 as *const ()).hash(state);
+        self.id.hash(state)
     }
 }
 
 impl PartialEq for ConnectionHandle {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.id == other.id
     }
 }
 
 impl Eq for ConnectionHandle {}
 
-/// Stores and manages peer connections to other Geese instances.
-pub struct ConnectionPool {
-    ctx: GeeseContextHandle,
-    peer_connections: RefCell<HashMap<ConnectionHandle, Box<dyn PeerChannel>>>
+impl Deref for ConnectionHandle {
+    type Target = ConnectionId;
+
+    fn deref(&self) -> &Self::Target {
+        &self.id
+    }
 }
 
-impl ConnectionPool {
+impl Drop for ConnectionHandle {
+    fn drop(&mut self) {
+        self.disposed_token.store(true, Ordering::Release);
+    }
+}
+
+/// Represents a reference to another Geese instance in the connection pool. Connection identifiers
+/// may be utilized to send messages or identify the senders of received messages.
+#[derive(Clone)]
+pub struct ConnectionId(Arc<()>);
+
+impl ConnectionId {
+    /// Creates a new, unique connection identifier.
+    fn new() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl std::fmt::Debug for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format!("{}", (&*self.0 as *const ()) as usize))
+    }
+}
+
+impl Hash for ConnectionId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (&*self.0 as *const ()).hash(state);
+    }
+}
+
+impl PartialEq for ConnectionId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ConnectionId {}
+
+/// Describes the state of an active peer connection.
+struct ConnectionState {
+    /// The channel over which data is sent for this connection.
+    pub channel: Box<dyn PeerChannel>,
+    /// Whether the channel has been dropped.
+    pub disposed_token: Arc<AtomicBool>
+}
+
+/// Stores and manages peer connections to other Geese instances.
+pub struct GeesePool {
+    ctx: GeeseContextHandle,
+    peer_connections: RefCell<FxHashMap<ConnectionId, ConnectionState>>
+}
+
+impl GeesePool {
     /// Adds the provided peer to the connection pool, enabling it to
     /// send and receive events.
     pub fn add_peer(&self, channel: Box<dyn PeerChannel>) -> ConnectionHandle {
         let handle = ConnectionHandle::new();
 
-        self.peer_connections().insert(handle.clone(), channel);
+        self.peer_connections().insert(handle.clone(), ConnectionState {
+            channel,
+            disposed_token: handle.disposed_token()
+        });
+
         self.ctx.raise_event(on::PeerAdded { handle: handle.clone() });
-
         handle
-    }
-
-    /// Removes the provided peer from the connection pool, preventing
-    /// it from sending or receiving further events.
-    pub fn remove_peer(&self, peer: ConnectionHandle) {
-        if self.peer_connections().contains_key(&peer) {
-            self.handle_peer_disconnection(peer, std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection aborted by local peer."));
-        }
-    }
-
-    /// Adds the provided peer in response to a peer addition event.
-    fn add_peer_event(&mut self, event: &notify::AddPeer) {
-        self.add_peer(event.channel.take().expect("The peer was already taken."));
-    }
-
-    /// Removes the provided peer in response to a peer removal event.
-    fn remove_peer_event(&mut self, event: &notify::RemovePeer) {
-        self.remove_peer(event.0.clone());
     }
 
     /// Deals with the disconnection of a remote peer by removing it from the active connection
     /// set and raising a disconnection event.
-    fn handle_peer_disconnection(&self, peer: ConnectionHandle, error: std::io::Error) {
+    fn handle_peer_disconnection(&self, peer: &ConnectionId, error: std::io::Error) {
         self.peer_connections().remove(&peer).expect("The specified peer was not connected.");
-        self.ctx.raise_event(on::PeerRemoved { handle: peer, reason: error });
+        self.ctx.raise_event(on::PeerRemoved { handle: peer.clone(), reason: error });
     }
 
-    /// Broadcasts the message to all specified remote peers. If any remote peer is no longer connected,
+    /// Sends the message to all specified remote peers. If any remote peer is no longer connected,
     /// it is ignored.
-    fn broadcast_message(&mut self, message: &notify::BroadcastMessage) {
+    fn send_message(&mut self, message: &notify::Message) {
         for recipient in message.recipients.take().expect("The recipient iterator was already taken.") {
-            self.write_event(message.event.cloned_message(), recipient);
+            self.write_event(&message.event, &recipient);
         }
     }
 
-    /// Sends the message to the specified remote peer. If the remote peer is no longer connected,
-    /// the message is dropped.
-    fn send_message(&mut self, message: &notify::Message) {
-        self.write_event(message.event.take().expect("Event was already taken."), message.recipient.clone());
+    /// Retrieves a mutable reference to the connections map of this struct.
+    fn peer_connections(&self) -> RefMut<'_, FxHashMap<ConnectionId, ConnectionState>> {
+        self.peer_connections.borrow_mut()
     }
 
-    /// Retrieves a mutable reference to the connections map of this struct.
-    fn peer_connections(&self) -> RefMut<'_, HashMap<ConnectionHandle, Box<dyn PeerChannel>>> {
-        self.peer_connections.borrow_mut()
+    /// Obtains a mutable reference to the state of the specified connection. This function
+    /// checks to see whether the connection has been dropped or does not exist, and
+    /// if so, returns none.
+    fn get_peer(&self, id: &ConnectionId) -> Option<RefMut<'_, dyn PeerChannel>> {
+        let mut connections = self.peer_connections();
+        let peer = connections.get_mut(&id);
+
+        if let Some(conn) = peer {
+            if conn.disposed_token.load(Ordering::Acquire) {
+                drop(connections);
+                self.handle_peer_disconnection(id, std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection aborted by local peer."));
+                None
+            }
+            else {
+                Some(RefMut::map(connections, |x| &mut *x.get_mut(&id).expect("No peer was associated with the provided identifier.").channel))
+            }
+        }
+        else {
+            None
+        }
     }
 
     /// Reads new event messages from remote Geese systems.
     fn read_events(&mut self, _: &notify::Update) {
         let connections = self.peer_connections().keys().cloned().collect::<Vec<_>>();
-        for conn in connections {
-            while self.read_peer(conn.clone()) {}
+        for conn in &connections {
+            while self.read_peer(conn) {}
         }
     }
 
     /// Reads the next message from the given connection,
     /// returning whether another read should be attempted.
-    fn read_peer(&mut self, handle: ConnectionHandle) -> bool {
-        let result = self.peer_connections()[&handle].read();
-        match result {
-            Ok(Some(event)) => { self.ctx.raise_boxed_event(event.into_message_event(handle)); true },
+    fn read_peer(&mut self, id: &ConnectionId) -> bool {
+        match self.get_peer(id).map(|mut x| x.read()).unwrap_or(Ok(None)) {
+            Ok(Some(event)) => { self.ctx.raise_boxed_event(event.as_message_event(id.clone())); true },
             Ok(None) => false,
             Err(error) => {
-                self.handle_peer_disconnection(handle, error);
+                self.handle_peer_disconnection(id, error);
                 false
             }
         }
@@ -288,9 +345,9 @@ impl ConnectionPool {
     /// Writes the given event to the specified recipient, and handles errors that occur
     /// by disconnecting the client. If the remote peer is no longer connected, the message
     /// is dropped.
-    fn write_event(&mut self, event: Message, recipient: ConnectionHandle) {
-        let result = self.peer_connections().get(&recipient)
-            .map(|conn| conn.write(event))
+    fn write_event(&mut self, event: &Message, recipient: &ConnectionId) {
+        let result = self.get_peer(&recipient)
+            .map(|mut conn| conn.write(event))
             .unwrap_or(Ok(()));
 
         if let Err(error) = result {
@@ -299,7 +356,7 @@ impl ConnectionPool {
     }
 }
 
-impl GeeseSystem for ConnectionPool {
+impl GeeseSystem for GeesePool {
     fn new(ctx: GeeseContextHandle) -> Self {
         let peer_connections = RefCell::new(HashMap::default());
 
@@ -310,11 +367,16 @@ impl GeeseSystem for ConnectionPool {
     }
 
     fn register(with: &mut GeeseSystemData<Self>) {
-        with.event(Self::add_peer_event);
-        with.event(Self::broadcast_message);
         with.event(Self::read_events);
-        with.event(Self::remove_peer_event);
         with.event(Self::send_message);
+    }
+}
+
+impl Drop for GeesePool {
+    fn drop(&mut self) {
+        for connection in self.peer_connections().values() {
+            assert!(connection.disposed_token.load(Ordering::Acquire), "Geese pool was dropped while a connection handle remained alive.");
+        }
     }
 }
 
@@ -322,42 +384,21 @@ impl GeeseSystem for ConnectionPool {
 pub mod notify {
     use super::*;
 
-    /// Causes the connection pool to notify a single recipient of an event.
+    /// Causes the connection pool to notify recipients of an event.
     pub struct Message {
-        pub(super) event: TakeOwnCell<super::Message>,
-        pub(super) recipient: ConnectionHandle
+        pub(super) event: super::Message,
+        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionId>>>
     }
 
     /// Sends the given event to the specified recipient.
-    pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionHandle) -> Message {
-        Message { event: TakeOwnCell::new(super::Message::new(event)), recipient }
+    pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionId) -> Message {
+        Message { event: super::Message::new(event), recipients: TakeOwnCell::new(Box::new(once(recipient))) }
     }
 
-    /// Causes the connection pool to notify a set of recipients of an event.
-    pub struct BroadcastMessage {
-        pub(super) event: Box<dyn IntoClonedMessage>,
-        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionHandle>>>
+    /// Broadcasts the given event to all specified recipients.
+    pub fn broadcast<T: 'static + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionId>>(event: T, recipients: Q) -> Message {
+        Message { event: super::Message::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
     }
-
-    /// Broadcast the given event to all specified recipients in the connection pool.
-    pub fn broadcast<T: 'static + Clone + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionHandle>>(event: T, recipients: Q) -> BroadcastMessage {
-        BroadcastMessage { event: Box::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
-    }
-
-    /// Adds a channel to the pool of active connections.
-    pub struct AddPeer {
-        pub(super) channel: TakeOwnCell<Box<dyn PeerChannel>>
-    }
-
-    impl AddPeer {
-        /// Instructs the connection pool to add the specified channel.
-        pub fn new(channel: Box<dyn PeerChannel>) -> Self {
-            Self { channel: TakeOwnCell::new(channel) }
-        }
-    }
-
-    /// Removes a channel from the pool.
-    pub struct RemovePeer(pub ConnectionHandle);
 
     /// Causes the connection pool to update all connections
     /// and raise any newly-received events appropriately.
@@ -371,7 +412,7 @@ pub mod on {
     /// Raised when a new peer is added to the connection pool.
     #[derive(Clone, Debug)]
     pub struct PeerAdded {
-        pub handle: ConnectionHandle
+        pub handle: ConnectionId
     }
 
     /// Raised when a peer is disconnected and removed from the
@@ -379,20 +420,20 @@ pub mod on {
     #[derive(Debug)]
     pub struct PeerRemoved {
         /// The handle of the disconnected peer.
-        pub handle: ConnectionHandle,
+        pub handle: ConnectionId,
         /// The reason that the peer disconnected.
         pub reason: std::io::Error
     }
 
     /// Raised when a message is received from another Geese instance in the connection pool.
     pub struct Message<T: 'static + Send + Sync> {
-        event: T,
-        sender: ConnectionHandle
+        event: Arc<T>,
+        sender: ConnectionId
     }
 
     impl<T: 'static + Send + Sync> Message<T> {
         /// Creates a new message for the event and sender.
-        pub(super) fn new(event: T, sender: ConnectionHandle) -> Self {
+        pub(super) fn new(event: Arc<T>, sender: ConnectionId) -> Self {
             Self { event, sender }
         }
 
@@ -402,7 +443,7 @@ pub mod on {
         }
 
         /// Obtains the sender associated with this message.
-        pub fn sender(&self) -> ConnectionHandle {
+        pub fn sender(&self) -> ConnectionId {
             self.sender.clone()
         }
     }
@@ -441,17 +482,19 @@ mod tests {
     #[test]
     fn test_local_message() {
         let mut a = GeeseContext::default();
-        a.raise_event(geese::notify::add_system::<ConnectionPool>());
+        a.raise_event(geese::notify::add_system::<GeesePool>());
         a.raise_event(geese::notify::add_system::<Receiver>());
 
         let mut b = GeeseContext::default();
-        b.raise_event(geese::notify::add_system::<ConnectionPool>());
+        b.raise_event(geese::notify::add_system::<GeesePool>());
 
         let (chan_a, chan_b) = LocalChannel::new_pair();
-        a.system::<ConnectionPool>().add_peer(Box::new(chan_a));
-        let handle_a = b.system::<ConnectionPool>().add_peer(Box::new(chan_b));
 
-        b.raise_event(notify::message(1, handle_a));
+        // Handles must be kept alive, as they are tied to the lifetime of a connection.
+        let _handle_b = a.system::<GeesePool>().add_peer(Box::new(chan_a));
+        let handle_a = b.system::<GeesePool>().add_peer(Box::new(chan_b));
+
+        b.raise_event(notify::message(1, handle_a.clone()));
         b.flush_events();
 
         a.raise_event(notify::Update);
