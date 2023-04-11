@@ -62,10 +62,15 @@
 //! assert_eq!(1, a.system::<Receiver>().0);
 //! # }
 //! ```
+//! 
+//! ## Optional features
+//! 
+//! **serde** - Provides a `PeerChannel` implementation that serializes and deserializes its data, as
+//! this is required for most forms of interprocess communication.
 
-// Provides a `PeerChannel` implementation that serializes and deserializes its data.
-//#[cfg(feature = "serde")]
-//pub mod serde;
+/// Provides a `PeerChannel` implementation that serializes and deserializes its data.
+#[cfg(feature = "serde")]
+pub mod serde;
 
 use fxhash::*;
 use geese::*;
@@ -125,6 +130,9 @@ pub trait PeerChannel {
 
     /// Writes an event to the channel.
     fn write(&mut self, message: &Message) -> std::io::Result<()>;
+
+    /// Flushes this channel, ensuring that any buffered messages are sent to their destination.
+    fn flush(&mut self) -> std::io::Result<()>;
 }
 
 /// Represents an in-process peer channel for sending events
@@ -156,6 +164,10 @@ impl PeerChannel for LocalChannel {
 
     fn write(&mut self, message: &Message) -> std::io::Result<()> {
         self.sender.send(message.clone()).map_err(|x| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, x))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -261,7 +273,8 @@ struct ConnectionState {
 /// Stores and manages peer connections to other Geese instances.
 pub struct GeesePool {
     ctx: GeeseContextHandle,
-    peer_connections: RefCell<FxHashMap<ConnectionId, ConnectionState>>
+    flush_required: bool,
+    peer_connections: RefCell<FxHashMap<ConnectionId, ConnectionState>>,
 }
 
 impl GeesePool {
@@ -284,14 +297,6 @@ impl GeesePool {
     fn handle_peer_disconnection(&self, peer: &ConnectionId, error: std::io::Error) {
         self.peer_connections().remove(&peer).expect("The specified peer was not connected.");
         self.ctx.raise_event(on::PeerRemoved { handle: peer.clone(), reason: error });
-    }
-
-    /// Sends the message to all specified remote peers. If any remote peer is no longer connected,
-    /// it is ignored.
-    fn send_message(&mut self, message: &notify::Message) {
-        for recipient in message.recipients.take().expect("The recipient iterator was already taken.") {
-            self.write_event(&message.event, &recipient);
-        }
     }
 
     /// Retrieves a mutable reference to the connections map of this struct.
@@ -321,14 +326,6 @@ impl GeesePool {
         }
     }
 
-    /// Reads new event messages from remote Geese systems.
-    fn read_events(&mut self, _: &notify::Update) {
-        let connections = self.peer_connections().keys().cloned().collect::<Vec<_>>();
-        for conn in &connections {
-            while self.read_peer(conn) {}
-        }
-    }
-
     /// Reads the next message from the given connection,
     /// returning whether another read should be attempted.
     fn read_peer(&mut self, id: &ConnectionId) -> bool {
@@ -354,19 +351,65 @@ impl GeesePool {
             self.handle_peer_disconnection(recipient, error);
         }
     }
+
+    /// Flushes all peer channels, disconnecting any peers who have errors.
+    fn flush_channels(&mut self) {
+        self.flush_required = false;
+
+        let mut disconnected = Vec::new();
+
+        for (id, peer) in self.peer_connections().iter_mut() {
+            if let Err(error) = peer.channel.flush() {
+                disconnected.push((id.clone(), error));
+            }
+        }
+
+        for (id, error) in disconnected {
+            self.handle_peer_disconnection(&id, error);
+        }
+    }
+
+    /// Reads new event messages from remote Geese systems.
+    fn read_events(&mut self, _: &notify::Update) {
+        let connections = self.peer_connections().keys().cloned().collect::<Vec<_>>();
+        for conn in &connections {
+            while self.read_peer(conn) {}
+        }
+
+        if self.flush_required {
+            self.flush_channels();
+        }
+
+        self.flush_required = true;
+    }
+
+    /// Sends the message to all specified remote peers. If any remote peer is no longer connected,
+    /// it is ignored.
+    fn send_message(&mut self, message: &notify::Message) {
+        for recipient in message.recipients.take().expect("The recipient iterator was already taken.") {
+            self.write_event(&message.event, &recipient);
+        }
+    }
+
+    fn flush_events(&mut self, _: &notify::Flush) {
+        self.flush_channels();
+    }
 }
 
 impl GeeseSystem for GeesePool {
     fn new(ctx: GeeseContextHandle) -> Self {
+        let flush_required = true;
         let peer_connections = RefCell::new(HashMap::default());
 
         Self {
             ctx,
+            flush_required,
             peer_connections
         }
     }
 
     fn register(with: &mut GeeseSystemData<Self>) {
+        with.event(Self::flush_events);
         with.event(Self::read_events);
         with.event(Self::send_message);
     }
@@ -403,6 +446,12 @@ pub mod notify {
     /// Causes the connection pool to update all connections
     /// and raise any newly-received events appropriately.
     pub struct Update;
+
+    /// Flushes all channels in the connection pool, clearing out buffered messages
+    /// and sending them to their final destination. `GeesePool` will flush all channels
+    /// at least once each update cycle, but this event serves as a hint as to when
+    /// all events have been received for a cycle.
+    pub struct Flush;
 }
 
 /// The set of events that this module raises.

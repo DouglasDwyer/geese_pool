@@ -58,3 +58,8 @@ a.flush_events();
 
 assert_eq!(1, a.system::<Receiver>().0);
 ```
+
+## Optional features
+
+**serde** - Provides a `PeerChannel` implementation that serializes and deserializes its data, as
+this is required for most forms of interprocess communication.

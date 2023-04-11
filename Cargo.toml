@@ -16,5 +16,7 @@ serde = { version = "1.0.159", optional = true }
 takecell = "0.1.1"
 
 [features]
-default = [ "serde" ]
 serde = [ "dep:serde" ]
+
+[package.metadata.docs.rs]
+all-features = true
