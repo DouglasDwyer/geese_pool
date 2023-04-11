@@ -75,6 +75,7 @@ pub mod serde;
 use fxhash::*;
 use geese::*;
 use std::any::*;
+use std::borrow::*;
 use std::cell::*;
 use std::collections::*;
 use std::hash::*;
@@ -193,6 +194,12 @@ impl ConnectionHandle {
     /// whether this connection handle has been dropped.
     fn disposed_token(&self) -> Arc<AtomicBool> {
         self.disposed_token.clone()
+    }
+}
+
+impl Borrow<ConnectionId> for ConnectionHandle {
+    fn borrow(&self) -> &ConnectionId {
+        &*self
     }
 }
 
