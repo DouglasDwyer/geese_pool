@@ -16,7 +16,7 @@ pub trait MessageSerializer: 'static {
 
 /// Provides the ability to send and received serialized messages with another Geese instance.
 pub struct SerializedPeerChannel<M: MessageSerializer> {
-    next_message_type: Option<u32>,
+    next_message_type: Option<u16>,
     serializer: M,
     set: SerializationSet<M>,
 }
@@ -35,7 +35,7 @@ impl<M: MessageSerializer> SerializedPeerChannel<M> {
 impl<M: MessageSerializer> PeerChannel for SerializedPeerChannel<M> {
     fn read(&mut self) -> Result<Option<Message>> {
         if self.next_message_type.is_none() {
-            self.next_message_type = self.serializer.deserialize::<u32>()?;
+            self.next_message_type = self.serializer.deserialize::<u16>()?;
         }
 
         if let Some(ty) = self.next_message_type {
@@ -76,18 +76,18 @@ impl<M: MessageSerializer> SerializationSet<M> {
     /// Adds an additional type to this serialization set, panicking if the type was already added.
     pub fn with_type<T: 'static + Send + Sync + Serialize + Deserialize<'static>>(mut self) -> Self {
         let set = Arc::make_mut(&mut self.0);
-        assert!(set.type_map.insert(TypeId::of::<T>(), set.serializers.len() as u32).is_none(), "Attempted to add duplicate type entry.");
+        assert!(set.type_map.insert(TypeId::of::<T>(), set.serializers.len() as u16).is_none(), "Attempted to add duplicate type entry.");
         set.serializers.push(Arc::new(TypedMessageSerializer::<T, _>::default()));
         self
     }
 
     /// Obtains the identifier and serializer for the provided type.
-    fn get_serializer(&self, id: TypeId) -> Option<(u32, &dyn MessageTypeSerializer<M>)> {
+    fn get_serializer(&self, id: TypeId) -> Option<(u16, &dyn MessageTypeSerializer<M>)> {
         self.0.type_map.get(&id).map(|&x| (x, &*self.0.serializers[x as usize]))
     }
 
     /// Gets the deserializer for the type with the provided identifier.
-    fn get_deserializer(&self, index: u32) -> Option<&dyn MessageTypeSerializer<M>> {
+    fn get_deserializer(&self, index: u16) -> Option<&dyn MessageTypeSerializer<M>> {
         self.0.serializers.get(index as usize).map(|x| &**x)
     }
 }
@@ -96,7 +96,7 @@ impl<M: MessageSerializer> SerializationSet<M> {
 #[derive(Debug, Default)]
 struct SerializationSetInner<M: MessageSerializer> {
     /// A mapping from types to their network identifiers.
-    pub type_map: FxHashMap<TypeId, u32>,
+    pub type_map: FxHashMap<TypeId, u16>,
     /// A list of serializers, ordered by their network identifiers.
     pub serializers: Vec<Arc<dyn MessageTypeSerializer<M>>>
 }
