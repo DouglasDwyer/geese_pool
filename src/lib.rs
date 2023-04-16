@@ -97,9 +97,9 @@ impl Message {
         Self(Arc::new(message))
     }
 
-    /// Converts this message into a `Box` containing the underlying data.
+    /// Converts this message into an `Any` reference to the underlying data.
     pub fn as_inner(&self) -> &dyn Any {
-        &self.0
+        (*self.0).as_any()
     }
 
     /// Converts this message into a `Box` containing an `on::Message` event that
@@ -107,19 +107,38 @@ impl Message {
     pub fn as_message_event(&self, sender: ConnectionId) -> Box<dyn Any> {
         self.0.clone().into_message_event(sender)
     }
+
+    /// Determines the name of the message's event type for debugging purposes.
+    fn message_name(&self) -> &str {
+        (*self.0).message_name()
+    }
 }
 
 /// Provides the backing implementation for conversion between
 /// messages and inner types.
 trait InnerMessage: Any + Send + Sync {
+    /// Converts this into an `Any` reference to the underlying data.
+    fn as_any(&self) -> &dyn Any;
+
     /// Converts this into a `Box` containing an `on::Message` event that
     /// holds the underlying data.
     fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any>;
+
+    /// Determines the name of the message's event type for debugging purposes.
+    fn message_name(&self) -> &str;
 }
 
 impl<T: 'static + Any + Send + Sync> InnerMessage for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any> {
         Box::new(on::Message::new(self, sender))
+    }
+
+    fn message_name(&self) -> &str {
+        type_name::<T>()
     }
 }
 

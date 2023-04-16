@@ -7,9 +7,9 @@ use std::io::*;
 /// Provides the ability to serialize and deserialize messages from a source.
 pub trait MessageSerializer: 'static {
     /// Serializes an object of the provided type to the remote source.
-    fn serialize<S: Serialize>(&mut self, value: S) -> Result<()>;
+    fn serialize<S: 'static + Serialize>(&mut self, value: &S) -> Result<()>;
     /// Deserializes an object of the provided type from the remote source.
-    fn deserialize<D: Deserialize<'static>>(&mut self) -> Result<Option<D>>;
+    fn deserialize<D: 'static + serde::de::DeserializeOwned>(&mut self) -> Result<Option<D>>;
     /// Flushes any buffered messages, ensuring that they reach the remote source.
     fn flush(&mut self) -> Result<()>;
 }
@@ -54,11 +54,11 @@ impl<M: MessageSerializer> PeerChannel for SerializedPeerChannel<M> {
     fn write(&mut self, message: &Message) -> Result<()> {
         let inner = message.as_inner();
         if let Some((id, ser)) = self.set.get_serializer(inner.type_id()) {
-            self.serializer.serialize(id)?;
+            self.serializer.serialize(&id)?;
             ser.serialize(inner, &mut self.serializer)
         }
         else {
-            Err(Error::new(ErrorKind::InvalidData, "Cannot serialize message of the provided type."))
+            Err(Error::new(ErrorKind::InvalidData, format!("Cannot serialize message of type {}", message.message_name())))
         }
     }
 
@@ -69,12 +69,12 @@ impl<M: MessageSerializer> PeerChannel for SerializedPeerChannel<M> {
 
 /// Represents a collection of messages that a `SerializedPeerChannel` is capable of sending/receiving. Both
 /// ends of the serialized channel must use identical serialization sets, with the same types added in the same order.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct SerializationSet<M: MessageSerializer>(Arc<SerializationSetInner<M>>);
 
 impl<M: MessageSerializer> SerializationSet<M> {
     /// Adds an additional type to this serialization set, panicking if the type was already added.
-    pub fn with_type<T: 'static + Send + Sync + Serialize + Deserialize<'static>>(mut self) -> Self {
+    pub fn with_type<T: 'static + Send + Sync + Serialize + serde::de::DeserializeOwned>(mut self) -> Self {
         let set = Arc::make_mut(&mut self.0);
         assert!(set.type_map.insert(TypeId::of::<T>(), set.serializers.len() as u16).is_none(), "Attempted to add duplicate type entry.");
         set.serializers.push(Arc::new(TypedMessageSerializer::<T, _>::default()));
@@ -92,8 +92,20 @@ impl<M: MessageSerializer> SerializationSet<M> {
     }
 }
 
+impl<M: MessageSerializer> Clone for SerializationSet<M> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<M: MessageSerializer> Default for SerializationSet<M> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
 /// Stores inner data about a set of types that may be serialized.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SerializationSetInner<M: MessageSerializer> {
     /// A mapping from types to their network identifiers.
     pub type_map: FxHashMap<TypeId, u16>,
@@ -107,8 +119,14 @@ impl<M: MessageSerializer> Clone for SerializationSetInner<M> {
     }
 }
 
+impl<M: MessageSerializer> Default for SerializationSetInner<M> {
+    fn default() -> Self {
+        Self { type_map: FxHashMap::default(), serializers: Vec::new() }
+    }
+}
+
 /// Provides an object-safe interface for serializing and deserializing data of a particular type.
-trait MessageTypeSerializer<M: MessageSerializer>: std::fmt::Debug {
+trait MessageTypeSerializer<M: MessageSerializer>: std::fmt::Debug + Send + Sync {
     /// Serializes the provided value using the given message serializer,
     /// or panics if the value was of the incorrect type.
     fn serialize(&self, value: &dyn Any, serializer: &mut M) -> Result<()>;
@@ -118,9 +136,9 @@ trait MessageTypeSerializer<M: MessageSerializer>: std::fmt::Debug {
 
 /// Implements the ability to serialize and deserialize one particular kind of data.
 #[derive(Clone)]
-struct TypedMessageSerializer<T: 'static + Send + Sync + Serialize + Deserialize<'static>, M: MessageSerializer>(PhantomData<fn(T, M)>);
+struct TypedMessageSerializer<T: 'static + Send + Sync + Serialize + serde::de::DeserializeOwned, M: MessageSerializer>(PhantomData<fn(T, M)>);
 
-impl<T: 'static + Send + Sync + Serialize + Deserialize<'static>, M: MessageSerializer> MessageTypeSerializer<M> for TypedMessageSerializer<T, M> {
+impl<T: 'static + Send + Sync + Serialize + serde::de::DeserializeOwned, M: MessageSerializer> MessageTypeSerializer<M> for TypedMessageSerializer<T, M> {
     fn serialize(&self, value: &dyn Any, serializer: &mut M) -> Result<()> {
         serializer.serialize(value.downcast_ref::<T>().expect("Value to be serialized was not of expected underlying type."))
     }
@@ -130,13 +148,13 @@ impl<T: 'static + Send + Sync + Serialize + Deserialize<'static>, M: MessageSeri
     }
 }
 
-impl<T: 'static + Send + Sync + Serialize + Deserialize<'static>, M: MessageSerializer> std::fmt::Debug for TypedMessageSerializer<T, M> {
+impl<T: 'static + Send + Sync + Serialize + serde::de::DeserializeOwned, M: MessageSerializer> std::fmt::Debug for TypedMessageSerializer<T, M> {
     fn fmt(&self, f: &mut __private::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple(type_name::<Self>()).finish()
     }
 }
 
-impl<T: 'static + Send + Sync + Serialize + Deserialize<'static>, M: MessageSerializer> Default for TypedMessageSerializer<T, M> {
+impl<T: 'static + Send + Sync + Serialize + serde::de::DeserializeOwned, M: MessageSerializer> Default for TypedMessageSerializer<T, M> {
     fn default() -> Self {
         Self(PhantomData::default())
     }
