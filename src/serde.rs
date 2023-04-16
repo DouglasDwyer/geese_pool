@@ -40,10 +40,14 @@ impl<M: MessageSerializer> PeerChannel for SerializedPeerChannel<M> {
 
         if let Some(ty) = self.next_message_type {
             if let Some(ser) = self.set.get_deserializer(ty) {
-                ser.deserialize(&mut self.serializer)
+                let res = ser.deserialize(&mut self.serializer)?;
+                if res.is_some() {
+                    self.next_message_type = None;
+                }
+                Ok(res)
             }
             else {
-                Err(Error::new(ErrorKind::InvalidData, "Unrecognized deserialization type."))
+                Err(Error::new(ErrorKind::InvalidData, format!("Unrecognized deserialization type {ty:?}.")))
             }
         }
         else {
