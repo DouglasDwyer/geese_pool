@@ -109,6 +109,7 @@ impl Message {
     }
 
     /// Determines the name of the message's event type for debugging purposes.
+    #[allow(dead_code)]
     fn message_name(&self) -> &str {
         (*self.0).message_name()
     }
@@ -218,7 +219,7 @@ impl ConnectionHandle {
 
 impl Borrow<ConnectionId> for ConnectionHandle {
     fn borrow(&self) -> &ConnectionId {
-        &*self
+        self
     }
 }
 
@@ -321,7 +322,7 @@ impl GeesePool {
     /// Deals with the disconnection of a remote peer by removing it from the active connection
     /// set and raising a disconnection event.
     fn handle_peer_disconnection(&self, peer: &ConnectionId, error: std::io::Error) {
-        self.peer_connections().remove(&peer).expect("The specified peer was not connected.");
+        self.peer_connections().remove(peer).expect("The specified peer was not connected.");
         self.ctx.raise_event(on::PeerRemoved { handle: peer.clone(), reason: error });
     }
 
@@ -335,7 +336,7 @@ impl GeesePool {
     /// if so, returns none.
     fn get_peer(&self, id: &ConnectionId) -> Option<RefMut<'_, dyn PeerChannel>> {
         let mut connections = self.peer_connections();
-        let peer = connections.get_mut(&id);
+        let peer = connections.get_mut(id);
 
         if let Some(conn) = peer {
             if conn.disposed_token.load(Ordering::Acquire) {
@@ -344,7 +345,7 @@ impl GeesePool {
                 None
             }
             else {
-                Some(RefMut::map(connections, |x| &mut *x.get_mut(&id).expect("No peer was associated with the provided identifier.").channel))
+                Some(RefMut::map(connections, |x| &mut *x.get_mut(id).expect("No peer was associated with the provided identifier.").channel))
             }
         }
         else {
@@ -369,7 +370,7 @@ impl GeesePool {
     /// by disconnecting the client. If the remote peer is no longer connected, the message
     /// is dropped.
     fn write_event(&mut self, event: &Message, recipient: &ConnectionId) {
-        let result = self.get_peer(&recipient)
+        let result = self.get_peer(recipient)
             .map(|mut conn| conn.write(event))
             .unwrap_or(Ok(()));
 
