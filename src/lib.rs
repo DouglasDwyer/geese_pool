@@ -30,12 +30,11 @@
 //! }
 //! 
 //! impl GeeseSystem for Receiver {
-//!     fn new(_: GeeseContextHandle) -> Self {
-//!         Self(0)
-//!     }
+//!     const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
+//!         .with(Self::respond);
 //! 
-//!     fn register(with: &mut GeeseSystemData<Self>) {
-//!         with.event(Self::respond);
+//!     fn new(_: GeeseContextHandle<Self>) -> Self {
+//!         Self(0)
 //!     }
 //! }
 //! 
@@ -43,9 +42,11 @@
 //! let mut a = GeeseContext::default();
 //! a.raise_event(geese::notify::add_system::<GeesePool>());
 //! a.raise_event(geese::notify::add_system::<Receiver>());
+//! a.flush_events();
 //!
 //! let mut b = GeeseContext::default();
 //! b.raise_event(geese::notify::add_system::<GeesePool>());
+//! b.flush_events();
 //! 
 //! let (chan_a, chan_b) = LocalChannel::new_pair();
 //! 
@@ -546,12 +547,11 @@ mod tests {
     }
 
     impl GeeseSystem for Receiver {
-        fn new(_: GeeseContextHandle) -> Self {
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
+            .with(Self::respond);
+        
+        fn new(_: GeeseContextHandle<Self>) -> Self {
             Self(0)
-        }
-
-        fn register(with: &mut GeeseSystemData<Self>) {
-            with.event(Self::respond);
         }
     }
 
@@ -560,9 +560,11 @@ mod tests {
         let mut a = GeeseContext::default();
         a.raise_event(geese::notify::add_system::<GeesePool>());
         a.raise_event(geese::notify::add_system::<Receiver>());
+        a.flush_events();
 
         let mut b = GeeseContext::default();
         b.raise_event(geese::notify::add_system::<GeesePool>());
+        b.flush_events();
 
         let (chan_a, chan_b) = LocalChannel::new_pair();
 
