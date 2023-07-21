@@ -104,7 +104,7 @@ impl Message {
 
     /// Converts this message into a `Box` containing an `on::Message` event that
     /// holds the underlying data.
-    pub fn as_message_event(&self, sender: ConnectionId) -> Box<dyn Any> {
+    pub fn as_message_event(&self, sender: ConnectionId) -> Box<dyn Any + Send + Sync> {
         self.0.clone().into_message_event(sender)
     }
 
@@ -123,7 +123,7 @@ trait InnerMessage: Any + Send + Sync {
 
     /// Converts this into a `Box` containing an `on::Message` event that
     /// holds the underlying data.
-    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any>;
+    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any + Send + Sync>;
 
     /// Determines the name of the message's event type for debugging purposes.
     fn message_name(&self) -> &str;
@@ -134,7 +134,7 @@ impl<T: 'static + Any + Send + Sync> InnerMessage for T {
         self
     }
 
-    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any> {
+    fn into_message_event(self: Arc<Self>, sender: ConnectionId) -> Box<dyn Any + Send + Sync> {
         Box::new(on::Message::new(self, sender))
     }
 
@@ -299,7 +299,7 @@ struct ConnectionState {
 
 /// Stores and manages peer connections to other Geese instances.
 pub struct GeesePool {
-    ctx: GeeseContextHandle,
+    ctx: GeeseContextHandle<Self>,
     flush_required: bool,
     peer_connections: RefCell<FxHashMap<ConnectionId, ConnectionState>>,
 }
@@ -357,7 +357,7 @@ impl GeesePool {
     /// returning whether another read should be attempted.
     fn read_peer(&mut self, id: &ConnectionId) -> bool {
         match self.get_peer(id).map(|mut x| x.read()).unwrap_or(Ok(None)) {
-            Ok(Some(event)) => { self.ctx.raise_boxed_event(event.as_message_event(id.clone())); true },
+            Ok(Some(event)) => { self.ctx.raise_event_boxed(event.as_message_event(id.clone())); true },
             Ok(None) => false,
             Err(error) => {
                 self.handle_peer_disconnection(id, error);
@@ -424,7 +424,12 @@ impl GeesePool {
 }
 
 impl GeeseSystem for GeesePool {
-    fn new(ctx: GeeseContextHandle) -> Self {
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
+        .with(Self::flush_events)
+        .with(Self::read_events)
+        .with(Self::send_message);
+
+    fn new(ctx: GeeseContextHandle<Self>) -> Self {
         let flush_required = true;
         let peer_connections = RefCell::new(HashMap::default());
 
@@ -433,12 +438,6 @@ impl GeeseSystem for GeesePool {
             flush_required,
             peer_connections
         }
-    }
-
-    fn register(with: &mut GeeseSystemData<Self>) {
-        with.event(Self::flush_events);
-        with.event(Self::read_events);
-        with.event(Self::send_message);
     }
 }
 
@@ -455,18 +454,19 @@ pub mod notify {
     use super::*;
 
     /// Causes the connection pool to notify recipients of an event.
-    pub struct Message {
+    pub(super) struct Message {
         pub(super) event: super::Message,
-        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionId>>>
+        pub(super) recipients: TakeOwnCell<Box<dyn Iterator<Item = ConnectionId> + Send + Sync>>
     }
 
     /// Sends the given event to the specified recipient.
-    pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionId) -> Message {
+    pub fn message<T: 'static + Send + Sync>(event: T, recipient: ConnectionId) -> impl Send + Sync {
         Message { event: super::Message::new(event), recipients: TakeOwnCell::new(Box::new(once(recipient))) }
     }
 
     /// Broadcasts the given event to all specified recipients.
-    pub fn broadcast<T: 'static + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionId>>(event: T, recipients: Q) -> Message {
+    pub fn broadcast<T: 'static + Send + Sync, Q: 'static + IntoIterator<Item = ConnectionId>>(event: T, recipients: Q) -> impl Send + Sync
+        where Q::IntoIter: Send + Sync {
         Message { event: super::Message::new(event), recipients: TakeOwnCell::new(Box::new(recipients.into_iter())) }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "geese_pool"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/geese_pool"
@@ -10,7 +10,7 @@ Message-passing system for networking with Geese.
 """
 
 [dependencies]
-geese = "0.2.0"
+geese = "0.3.0"
 fxhash = "0.2.1"
 serde = { version = "1.0.159", optional = true }
 takecell = "0.1.1"
